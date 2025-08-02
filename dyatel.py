@@ -11,7 +11,7 @@ def get_shecan_dns():
         answers = dns.resolver.resolve('free.shecan.ir', 'A')
         return answers[0].address
     except Exception:
-        return None
+        return ''
 
 def parse_hosts_lines():
     entries = []
@@ -145,7 +145,8 @@ class MainFrame(wx.Frame):
                 capture_output=True, text=True, shell=True
             )
             self.result_box.SetValue(result.stdout)
-            match = re.search(r'\s*(\d{1,3}(\.\d{1,3}){3})', result.stdout[49:])
+            res = result.stdout.replace(get_shecan_dns(), '')
+            match = re.search(r'\s*(\d{1,3}(\.\d{1,3}){3})', res)
             if match:
                 ip = match.group(1)
                 self.ip_summary.SetValue(f"{domain} → {ip}")
