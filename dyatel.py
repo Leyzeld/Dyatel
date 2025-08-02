@@ -3,6 +3,7 @@ import dns.resolver
 import re
 import subprocess
 import ipaddress
+import threading
 
 HOSTS_PATH = r'C:\Windows\System32\drivers\etc\hosts'
 
@@ -40,7 +41,7 @@ def write_hosts_entries(entries):
 
 class MainFrame(wx.Frame):
     def __init__(self):
-        super().__init__(None, title="DNS & Hosts Manager", size=(1000, 600))
+        super().__init__(None, title="Dyatel", size=(1000, 600))
         splitter = wx.SplitterWindow(self)
         left_panel = wx.Panel(splitter)
         right_panel = wx.Panel(splitter)
@@ -80,7 +81,8 @@ class MainFrame(wx.Frame):
         right_sizer.Add(wx.StaticText(right_panel, label="Результат nslookup:"), flag=wx.LEFT | wx.TOP, border=5)
         right_sizer.Add(self.result_box, proportion=1, flag=wx.EXPAND | wx.ALL, border=5)
 
-        self.ip_summary = wx.TextCtrl(right_panel, style=wx.TE_READONLY)
+        self.ip_summary = wx.ComboBox(right_panel, style=wx.CB_READONLY)
+        right_sizer.Add(wx.StaticText(right_panel, label="IP адреса:"), flag=wx.LEFT | wx.TOP, border=5)
         right_sizer.Add(self.ip_summary, flag=wx.EXPAND | wx.LEFT | wx.RIGHT, border=5)
 
         self.add_btn = wx.Button(right_panel, label="Добавить в hosts")
@@ -96,11 +98,22 @@ class MainFrame(wx.Frame):
         self.load_dns()
 
     def load_hosts_table(self):
+        v_scroll_pos = self.hosts_list.GetScrollPos(wx.VERTICAL)
+        selected_index = self.hosts_list.GetFirstSelected()
+
+        self.hosts_list.Freeze()
         self.hosts_list.DeleteAllItems()
         for idx, (line, active, ip, domain) in enumerate(self.hosts_entries):
-            index = self.hosts_list.InsertItem(idx, "✓" if active else "")
+            index = self.hosts_list.InsertItem(idx, "✅" if active else "❌")
             self.hosts_list.SetItem(index, 1, ip)
             self.hosts_list.SetItem(index, 2, domain)
+        self.hosts_list.Thaw()
+
+        if 0 <= selected_index < self.hosts_list.GetItemCount():
+            self.hosts_list.Select(selected_index)
+
+        wx.CallAfter(lambda: self.hosts_list.ScrollLines(v_scroll_pos))
+
 
     def on_column_click(self, event):
         col = event.GetColumn()
@@ -129,6 +142,7 @@ class MainFrame(wx.Frame):
     def on_nslookup(self, event):
         domain = self.domain_entry.GetValue().strip()
         dns = self.dns_entry.GetValue().strip()
+
         if not domain:
             wx.MessageBox("Введите домен для проверки", "Ошибка")
             return
@@ -139,34 +153,50 @@ class MainFrame(wx.Frame):
             wx.MessageBox("Введённый DNS-адрес некорректен", "Ошибка")
             return
 
+        self.result_box.SetValue("Выполняется nslookup...")
+        self.ip_summary.Clear()
+
+        thread = threading.Thread(target=self.run_nslookup_threaded, args=(domain, dns))
+        thread.start()
+
+    def run_nslookup_threaded(self, domain, dns):
         try:
             result = subprocess.run(
                 ['nslookup', domain, dns],
                 capture_output=True, text=True, shell=True
             )
-            self.result_box.SetValue(result.stdout)
-            res = result.stdout.replace(get_shecan_dns(), '')
-            match = re.search(r'\s*(\d{1,3}(\.\d{1,3}){3})', res)
-            if match:
-                ip = match.group(1)
-                self.ip_summary.SetValue(f"{domain} → {ip}")
+
+            output = result.stdout
+            ip_list = re.findall(r'(?<!\d)(?:\d{1,3}\.){3}\d{1,3}(?!\d)', output.replace(dns, ''))
+
+            # Обновление интерфейса — через CallAfter
+            wx.CallAfter(self.result_box.SetValue, output)
+            wx.CallAfter(self.ip_summary.Clear)
+            if ip_list:
+                wx.CallAfter(self.ip_summary.AppendItems, ip_list)
+                wx.CallAfter(self.ip_summary.SetSelection, 0)
             else:
-                self.ip_summary.SetValue("IP не найден")
+                wx.CallAfter(self.ip_summary.Append, "IP не найден")
+                wx.CallAfter(self.ip_summary.SetSelection, 0)
+
         except Exception as e:
-            self.result_box.SetValue(f"Ошибка: {e}")
-            self.ip_summary.SetValue("")
+            wx.CallAfter(self.result_box.SetValue, f"Ошибка: {e}")
+            wx.CallAfter(self.ip_summary.Clear)
 
     def on_add_to_hosts(self, event):
-        line_text = self.ip_summary.GetValue()
-        if '→' not in line_text:
+        domain = self.domain_entry.GetValue().strip()
+        ip = self.ip_summary.GetValue().strip()
+
+        if not domain or not ip or "не найден" in ip.lower():
             return
-        domain, ip = map(str.strip, line_text.split('→'))
 
         entries = parse_hosts_lines()
         updated = False
+        found = False
 
         for i, (orig, active, entry_ip, entry_domain) in enumerate(entries):
             if entry_domain == domain:
+                found = True
                 dlg = wx.MessageDialog(self, f"Запись для {domain} уже существует.\nЗаменить?", "Подтверждение", wx.YES_NO)
                 if dlg.ShowModal() == wx.ID_YES:
                     entries[i] = (f"{ip} {domain}", True, ip, domain)
@@ -174,13 +204,19 @@ class MainFrame(wx.Frame):
                 dlg.Destroy()
                 break
 
-        if not updated:
+        if not found:
             entries.append((f"{ip} {domain}", True, ip, domain))
+            updated = True
 
-        if write_hosts_entries(entries):
-            self.hosts_entries = entries
-            self.load_hosts_table()
-            wx.MessageBox("Запись добавлена!", "Успех")
+        if updated:
+            if write_hosts_entries(entries):
+                self.hosts_entries = entries
+                self.load_hosts_table()
+                subprocess.run(["ipconfig", "/flushdns"], shell=True)
+                wx.MessageBox("Запись добавлена или обновлена!", "Успех")
+
+
+
 
     def toggle_host_entry(self, event):
         index = event.GetIndex()
