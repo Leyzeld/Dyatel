@@ -4,16 +4,29 @@ import re
 import subprocess
 import ipaddress
 import threading
+import concurrent.futures
 
 HOSTS_PATH = r'C:\Windows\System32\drivers\etc\hosts'
+DONT_WORK = 0
+MAX_WORKERS = 8
+ATTEMPTS = 12
+DNS_SERVERS = [
+    'free.shecan.ir',
+    'dns.electrotm.org',
+    'dns.malw.link',
+]
 
 def get_shecan_dns():
-    try:
-        answers = dns.resolver.resolve('free.shecan.ir', 'A')
-        return answers[0].address
-    except Exception:
-        return ''
-
+    dns_ips = []
+    for server in DNS_SERVERS:
+        try:
+            answers = dns.resolver.resolve(server, 'A')
+            for answer in answers:
+                dns_ips.append(answer.address)
+        except Exception as e:
+            wx.MessageBox(f"Ошибка при получении DNS {server}: {e}", "Ошибка")
+    return dns_ips
+    
 def parse_hosts_lines():
     entries = []
     try:
@@ -65,7 +78,7 @@ class MainFrame(wx.Frame):
 
         right_sizer = wx.BoxSizer(wx.VERTICAL)
 
-        self.dns_entry = wx.TextCtrl(right_panel)
+        self.dns_entry = wx.ComboBox(right_panel, style=wx.CB_READONLY)
         right_sizer.Add(wx.StaticText(right_panel, label="DNS-адрес:"), flag=wx.LEFT | wx.TOP, border=5)
         right_sizer.Add(self.dns_entry, flag=wx.EXPAND | wx.LEFT | wx.RIGHT, border=5)
 
@@ -73,9 +86,18 @@ class MainFrame(wx.Frame):
         right_sizer.Add(wx.StaticText(right_panel, label="Домен:"), flag=wx.LEFT | wx.TOP, border=5)
         right_sizer.Add(self.domain_entry, flag=wx.EXPAND | wx.LEFT | wx.RIGHT, border=5)
 
+        button_sizer = wx.BoxSizer(wx.HORIZONTAL)
+
         self.nslookup_btn = wx.Button(right_panel, label="nslookup")
         self.nslookup_btn.Bind(wx.EVT_BUTTON, self.on_nslookup)
-        right_sizer.Add(self.nslookup_btn, flag=wx.ALL | wx.ALIGN_CENTER, border=5)
+        button_sizer.Add(self.nslookup_btn, 0, wx.ALL, 5)
+
+        self.update_all_btn = wx.Button(right_panel, label="update all")
+        self.update_all_btn.Bind(wx.EVT_BUTTON, self.on_update_all)
+        button_sizer.Add(self.update_all_btn, 0, wx.ALL, 5)
+
+        right_sizer.Add(button_sizer, 0, wx.ALIGN_CENTER_HORIZONTAL)
+
 
         self.result_box = wx.TextCtrl(right_panel, style=wx.TE_MULTILINE | wx.TE_READONLY)
         right_sizer.Add(wx.StaticText(right_panel, label="Результат nslookup:"), flag=wx.LEFT | wx.TOP, border=5)
@@ -133,15 +155,18 @@ class MainFrame(wx.Frame):
         self.load_hosts_table()
 
     def load_dns(self):
-        dns = get_shecan_dns()
-        if dns:
-            self.dns_entry.SetValue(dns)
+        dns_ips = get_shecan_dns()
+        if dns_ips:
+            self.dns_entry.Clear()
+            self.dns_entry.AppendItems(dns_ips)
+            self.dns_entry.SetSelection(0)
         else:
-            self.dns_entry.SetValue("Ошибка")
+            self.dns_entry.Clear()
+            self.dns_entry.Append("Ошибка получения DNS")
 
     def on_nslookup(self, event):
-        domain = self.domain_entry.GetValue().strip()
         dns = self.dns_entry.GetValue().strip()
+        domain = self.domain_entry.GetValue().strip()
 
         if not domain:
             wx.MessageBox("Введите домен для проверки", "Ошибка")
@@ -159,6 +184,99 @@ class MainFrame(wx.Frame):
         thread = threading.Thread(target=self.run_nslookup_threaded, args=(domain, dns))
         thread.start()
 
+    def on_update_all(self, event):
+        dns = self.dns_entry.GetValue().strip()
+
+        try:
+            ipaddress.ip_address(dns)
+        except ValueError:
+            wx.MessageBox("Введённый DNS-адрес некорректен", "Ошибка")
+            return
+
+        updated_entries = []
+        results = []
+
+        self.result_box.SetValue("Выполняется массовое обновление...\n")
+
+        def update_all_thread():
+            nonlocal results
+
+            with concurrent.futures.ThreadPoolExecutor(max_workers=MAX_WORKERS) as executor:
+                futures = [
+                    executor.submit(self.update_host_entry, domain, dns, results)
+                    for _, active, ip, domain in self.hosts_entries
+                    if active and ip != '0.0.0.0'
+                ]
+
+            concurrent.futures.wait(futures)
+
+            for line, active, ip, domain in self.hosts_entries:
+                if active:
+                    found = False
+                    for result in results:
+                        if result['domain'] == domain:
+                            new_ip = result['ip']
+                            if new_ip is not None:
+                                updated_entries.append((f"{new_ip} {domain}", True, new_ip, domain))
+                                found = True
+                                break
+                    if not found:
+                        updated_entries.append((line, active, ip, domain))
+                else:
+                    updated_entries.append((line, active, ip, domain))
+
+            # for line, active, ip, domain in self.hosts_entries:
+                # if ip == '0.0.0.0':
+                    # updated_entries.append((line, active, ip, domain))
+
+            if write_hosts_entries(updated_entries):
+                wx.CallAfter(self.hosts_entries.__setitem__, slice(None), updated_entries)
+                wx.CallAfter(self.load_hosts_table)
+                wx.CallAfter(subprocess.run, ["ipconfig", "/flushdns"], shell=True)
+                wx.CallAfter(wx.MessageBox, "Обновление записей завершено!", "Успех")
+                wx.CallAfter(self.result_box.AppendText, f" Не удалось обработать {DONT_WORK} доменов\n")
+        threading.Thread(target=update_all_thread, daemon=True).start()
+
+    def update_host_entry(self, domain, dns, results):
+        attempts = ATTEMPTS
+        while attempts != -1 and attempts != 0:
+            try:
+                result = subprocess.run(
+                    ['nslookup', domain, dns],
+                    capture_output=True,
+                    text=True,
+                    shell=True,
+                    timeout=5
+                )
+
+                output = result.stdout
+                ip_list = re.findall(r'(?<!\d)(?:\d{1,3}\.){3}\d{1,3}(?!\d)', output.replace(dns, ''))
+
+                if ip_list:
+                    results.append({
+                        'domain': domain,
+                        'ip': ip_list[0]
+                    })
+                    wx.CallAfter(self.result_box.AppendText, f"Домен {domain} -> {ip_list[0]}\n")
+                    attempts = -1
+                else:
+                    results.append({
+                        'domain': domain,
+                        'ip': None
+                    })
+                    wx.CallAfter(self.result_box.AppendText, f"Домен {domain}: IP не найден\n")
+                    wx.CallAfter(self.result_box.AppendText, f" Осталось попыток обработать {domain}: {attempts}\n")
+                    attempts -= 1
+
+            except Exception as e:
+                wx.CallAfter(self.result_box.AppendText, f"Ошибка при обработке {domain}: {str(e)}\n")
+                wx.CallAfter(self.result_box.AppendText, f" Осталось попыток обработать {domain}: {attempts}\n")
+                attempts -= 1
+        
+        if attempts == 0:
+            global DONT_WORK
+            DONT_WORK += 1
+
     def run_nslookup_threaded(self, domain, dns):
         try:
             result = subprocess.run(
@@ -169,7 +287,6 @@ class MainFrame(wx.Frame):
             output = result.stdout
             ip_list = re.findall(r'(?<!\d)(?:\d{1,3}\.){3}\d{1,3}(?!\d)', output.replace(dns, ''))
 
-            # Обновление интерфейса — через CallAfter
             wx.CallAfter(self.result_box.SetValue, output)
             wx.CallAfter(self.ip_summary.Clear)
             if ip_list:
