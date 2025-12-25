@@ -16,17 +16,18 @@ DNS_SERVERS = [
     'dns.malw.link',
 ]
 
-def get_shecan_dns():
-    dns_ips = []
+def get_dns_ip():
+    dns_map = {}
     for server in DNS_SERVERS:
         try:
             answers = dns.resolver.resolve(server, 'A')
             for answer in answers:
-                dns_ips.append(answer.address)
+                dns_map[answer.address] = server
         except Exception as e:
             wx.MessageBox(f"Ошибка при получении DNS {server}: {e}", "Ошибка")
-    return dns_ips
-    
+    return dns_map
+
+
 def parse_hosts_lines():
     entries = []
     try:
@@ -42,6 +43,7 @@ def parse_hosts_lines():
     except Exception:
         return []
 
+
 def write_hosts_entries(entries):
     try:
         with open(HOSTS_PATH, 'w') as f:
@@ -51,6 +53,7 @@ def write_hosts_entries(entries):
         return True
     except Exception:
         return False
+
 
 class MainFrame(wx.Frame):
     def __init__(self):
@@ -69,7 +72,6 @@ class MainFrame(wx.Frame):
 
         self.hosts_list.Bind(wx.EVT_LIST_ITEM_ACTIVATED, self.toggle_host_entry)
         self.hosts_list.Bind(wx.EVT_LIST_COL_CLICK, self.on_column_click)
-
         self.hosts_list.Bind(wx.EVT_LIST_ITEM_RIGHT_CLICK, self.on_right_click)
 
         left_sizer = wx.BoxSizer(wx.VERTICAL)
@@ -81,6 +83,11 @@ class MainFrame(wx.Frame):
         self.dns_entry = wx.ComboBox(right_panel, style=wx.CB_READONLY)
         right_sizer.Add(wx.StaticText(right_panel, label="DNS-адрес:"), flag=wx.LEFT | wx.TOP, border=5)
         right_sizer.Add(self.dns_entry, flag=wx.EXPAND | wx.LEFT | wx.RIGHT, border=5)
+
+        self.dns_label = wx.StaticText(right_panel, label="DNS сервер: -")
+        right_sizer.Add(self.dns_label, flag=wx.LEFT | wx.TOP, border=5)
+
+        self.dns_entry.Bind(wx.EVT_COMBOBOX, self.on_dns_selected)
 
         self.domain_entry = wx.TextCtrl(right_panel)
         right_sizer.Add(wx.StaticText(right_panel, label="Домен:"), flag=wx.LEFT | wx.TOP, border=5)
@@ -97,7 +104,6 @@ class MainFrame(wx.Frame):
         button_sizer.Add(self.update_all_btn, 0, wx.ALL, 5)
 
         right_sizer.Add(button_sizer, 0, wx.ALIGN_CENTER_HORIZONTAL)
-
 
         self.result_box = wx.TextCtrl(right_panel, style=wx.TE_MULTILINE | wx.TE_READONLY)
         right_sizer.Add(wx.StaticText(right_panel, label="Результат nslookup:"), flag=wx.LEFT | wx.TOP, border=5)
@@ -136,7 +142,6 @@ class MainFrame(wx.Frame):
 
         wx.CallAfter(lambda: self.hosts_list.ScrollLines(v_scroll_pos))
 
-
     def on_column_click(self, event):
         col = event.GetColumn()
         if col == self.sort_column:
@@ -155,14 +160,25 @@ class MainFrame(wx.Frame):
         self.load_hosts_table()
 
     def load_dns(self):
-        dns_ips = get_shecan_dns()
-        if dns_ips:
-            self.dns_entry.Clear()
-            self.dns_entry.AppendItems(dns_ips)
+        dns_map = get_dns_ip()
+        self.dns_map = dns_map
+
+        self.dns_entry.Clear()
+
+        if dns_map:
+            self.dns_entry.AppendItems(list(dns_map.keys()))
             self.dns_entry.SetSelection(0)
+            self.update_dns_label()
         else:
-            self.dns_entry.Clear()
             self.dns_entry.Append("Ошибка получения DNS")
+
+    def update_dns_label(self):
+        ip = self.dns_entry.GetValue()
+        server = self.dns_map.get(ip, "Неизвестный сервер")
+        self.dns_label.SetLabel(f"DNS сервер: {server}")
+
+    def on_dns_selected(self, event):
+        self.update_dns_label()
 
     def on_nslookup(self, event):
         dns = self.dns_entry.GetValue().strip()
@@ -225,16 +241,13 @@ class MainFrame(wx.Frame):
                 else:
                     updated_entries.append((line, active, ip, domain))
 
-            # for line, active, ip, domain in self.hosts_entries:
-                # if ip == '0.0.0.0':
-                    # updated_entries.append((line, active, ip, domain))
-
             if write_hosts_entries(updated_entries):
                 wx.CallAfter(self.hosts_entries.__setitem__, slice(None), updated_entries)
                 wx.CallAfter(self.load_hosts_table)
                 wx.CallAfter(subprocess.run, ["ipconfig", "/flushdns"], shell=True)
                 wx.CallAfter(wx.MessageBox, "Обновление записей завершено!", "Успех")
                 wx.CallAfter(self.result_box.AppendText, f" Не удалось обработать {DONT_WORK} доменов\n")
+
         threading.Thread(target=update_all_thread, daemon=True).start()
 
     def update_host_entry(self, domain, dns, results):
@@ -332,9 +345,6 @@ class MainFrame(wx.Frame):
                 subprocess.run(["ipconfig", "/flushdns"], shell=True)
                 wx.MessageBox("Запись добавлена или обновлена!", "Успех")
 
-
-
-
     def toggle_host_entry(self, event):
         index = event.GetIndex()
         line, active, ip, domain = self.hosts_entries[index]
@@ -380,6 +390,7 @@ class MainFrame(wx.Frame):
             if write_hosts_entries(self.hosts_entries):
                 self.load_hosts_table()
         dlg.Destroy()
+
 
 if __name__ == "__main__":
     app = wx.App(False)
